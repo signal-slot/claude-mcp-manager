@@ -47,6 +47,11 @@ enum Commands {
         /// Target config group number
         to: usize,
     },
+    /// Move a per-project MCP server to global config (e.g. globalize server-name)
+    Globalize {
+        /// Name of the MCP server (use name#N to specify config group)
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +297,18 @@ fn list_mcp_servers() {
             name.to_string()
         };
 
-        println!("  {} {}{}", marker, name_display, diff_marker);
+        let is_global = entries.iter().any(|e| e.source_project == "(global)");
+        let project_entries: Vec<_> = entries.iter().enumerate()
+            .filter(|(_, e)| e.source_project != "(global)")
+            .collect();
+
+        let global_label = if is_global {
+            format!(" {}", "(global)".dimmed())
+        } else {
+            String::new()
+        };
+
+        println!("  {} {}{}{}", marker, name_display, global_label, diff_marker);
 
         // Show command/url (note if configs differ)
         if let Some(entry) = entries.first() {
@@ -306,16 +322,17 @@ fn list_mcp_servers() {
         }
 
         // Show projects using this server
-        if has_diff {
-            for g in 1..=n_groups {
-                println!("    {}",format!("#{}:", g).dimmed());
-                for (idx, entry) in entries.iter().enumerate() {
-                    if groups[idx] != g {
+        if !project_entries.is_empty() {
+            if has_diff {
+                for g in 1..=n_groups {
+                    let group_projects: Vec<_> = project_entries.iter()
+                        .filter(|(idx, _)| groups[*idx] == g)
+                        .collect();
+                    if group_projects.is_empty() {
                         continue;
                     }
-                    if entry.source_project == "(global)" {
-                        println!("      - {}", "(global)".dimmed());
-                    } else {
+                    println!("    {}",format!("#{}:", g).dimmed());
+                    for (_, entry) in group_projects {
                         let is_cwd = entry.source_project == cwd;
                         let short_path = shorten_path(&entry.source_project);
                         if is_cwd {
@@ -325,13 +342,9 @@ fn list_mcp_servers() {
                         }
                     }
                 }
-            }
-        } else {
-            println!("    {}", "used in:".dimmed());
-            for entry in entries {
-                if entry.source_project == "(global)" {
-                    println!("      - {}", "(global)".dimmed());
-                } else {
+            } else {
+                println!("    {}", "used in:".dimmed());
+                for (_, entry) in &project_entries {
                     let is_cwd = entry.source_project == cwd;
                     let short_path = shorten_path(&entry.source_project);
                     if is_cwd {
@@ -382,12 +395,17 @@ fn show_mcp_server(name: &str) {
                 "not enabled in current project".yellow()
             };
 
-            println!("{} {}", "MCP Server:".bold(), name.bold());
+            let is_global = entries.iter().any(|e| e.source_project == "(global)");
+            let scope = if is_global { "global" } else { "per-project" };
+            println!("{} {} {}", "MCP Server:".bold(), name.bold(), format!("({})", scope).dimmed());
             println!("  {} {}", "Status:".dimmed(), status);
             println!();
 
             let groups = assign_config_groups(entries);
             let n_groups = *groups.iter().max().unwrap_or(&1);
+            let project_entries: Vec<_> = entries.iter().enumerate()
+                .filter(|(_, e)| e.source_project != "(global)")
+                .collect();
 
             let baseline = &entries[0];
             let baseline_args = normalize_args(&baseline.server.args, &baseline.source_project);
@@ -455,18 +473,15 @@ fn show_mcp_server(name: &str) {
                     println!("    {} {}", "env:".dimmed(), "(none)".yellow());
                 }
 
-                // Show projects in this group
-                println!("    {}", "used in:".dimmed());
-                for (idx, entry) in entries.iter().enumerate() {
-                    if groups[idx] != g {
-                        continue;
+                // Show projects in this group (skip global entries)
+                let group_projects: Vec<_> = project_entries.iter()
+                    .filter(|(idx, _)| groups[*idx] == g)
+                    .collect();
+                if !group_projects.is_empty() {
+                    println!("    {}", "used in:".dimmed());
+                    for (_, entry) in group_projects {
+                        println!("      - {}", shorten_path(&entry.source_project));
                     }
-                    let source = if entry.source_project == "(global)" {
-                        "(global)".to_string()
-                    } else {
-                        shorten_path(&entry.source_project)
-                    };
-                    println!("      - {}", source);
                 }
                 println!();
             }
@@ -820,6 +835,160 @@ fn migrate_mcp_server(name: &str, from: usize, to: usize) {
     );
 }
 
+fn globalize_mcp_server(name: &str) {
+    let (server_name, config_index) = parse_name_index(name);
+    let all_servers = collect_all_mcp_servers();
+
+    let entries = match all_servers.get(server_name) {
+        Some(e) => e,
+        None => {
+            eprintln!("{} MCP server '{}' not found", "Error:".red(), server_name);
+            std::process::exit(1);
+        }
+    };
+
+    // Check if already global
+    if entries.iter().any(|e| e.source_project == "(global)") {
+        println!(
+            "{} MCP server '{}' is already defined globally",
+            "Note:".yellow(),
+            server_name
+        );
+        return;
+    }
+
+    let groups = assign_config_groups(entries);
+    let n_groups = *groups.iter().max().unwrap_or(&1);
+
+    // Select which config group to globalize
+    let group = if let Some(idx) = config_index {
+        if idx == 0 || idx > n_groups {
+            eprintln!(
+                "{} Invalid config index #{}. Available: #1-#{}",
+                "Error:".red(),
+                idx,
+                n_groups
+            );
+            std::process::exit(1);
+        }
+        idx
+    } else if n_groups > 1 {
+        eprintln!(
+            "{} {} configurations found for '{}'. Use #N to specify:",
+            "Error:".red(),
+            n_groups,
+            server_name
+        );
+        for g in 1..=n_groups {
+            let rep_idx = groups.iter().position(|&gi| gi == g).unwrap();
+            let rep = &entries[rep_idx];
+            let target = rep.server.display_target();
+            let count = groups.iter().filter(|&&gi| gi == g).count();
+            eprintln!(
+                "  #{} {} ({} {})",
+                g,
+                target,
+                count,
+                if count == 1 { "project" } else { "projects" }
+            );
+        }
+        eprintln!();
+        eprintln!("Example: cc-mcp-admin globalize {}#1", server_name);
+        std::process::exit(1);
+    } else {
+        1
+    };
+
+    // Get representative config (with project paths removed from args)
+    let rep_idx = groups.iter().position(|&g| g == group).unwrap();
+    let rep = &entries[rep_idx];
+    let mut global_server = rep.server.clone();
+    // Strip project-specific paths from args for global config
+    for arg in &mut global_server.args {
+        if arg.contains(&rep.source_project) {
+            *arg = arg.replace(&rep.source_project, "<PROJECT>");
+        }
+    }
+
+    // Warn if args contain project-specific placeholder
+    let has_project_path = global_server.args.iter().any(|a| a.contains("<PROJECT>"));
+    if has_project_path {
+        eprintln!(
+            "{} This server's args contain project-specific paths.",
+            "Warning:".yellow()
+        );
+        eprintln!("  Global config will use '<PROJECT>' as placeholder, which may not work.");
+        eprintln!("  Consider whether this server is suitable for global use.");
+        eprintln!();
+    }
+
+    let claude_json_path = get_claude_json_path().expect("Failed to get claude.json path");
+    let content = fs::read_to_string(&claude_json_path).expect("Failed to read ~/.claude.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).expect("Failed to parse ~/.claude.json");
+
+    // Add to top-level mcpServers
+    if json.get("mcpServers").is_none() {
+        json["mcpServers"] = serde_json::json!({});
+    }
+    json["mcpServers"][server_name] = serde_json::to_value(&global_server).unwrap();
+
+    // Remove from all per-project configs in the same group
+    let mut removed = 0;
+    let mut mcp_json_warn = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if groups[idx] != group {
+            continue;
+        }
+
+        // Check if also in .mcp.json
+        let mcp_path = std::path::Path::new(&entry.source_project).join(".mcp.json");
+        if mcp_path.exists() {
+            if let Ok(c) = fs::read_to_string(&mcp_path) {
+                if let Ok(mj) = serde_json::from_str::<McpJsonFile>(&c) {
+                    if mj.mcp_servers.contains_key(server_name) {
+                        mcp_json_warn.push(entry.source_project.clone());
+                    }
+                }
+            }
+        }
+
+        // Remove from ~/.claude.json per-project
+        if let Some(mcp_servers) = json
+            .get_mut("projects")
+            .and_then(|p| p.get_mut(&entry.source_project))
+            .and_then(|c| c.get_mut("mcpServers"))
+            .and_then(|m| m.as_object_mut())
+        {
+            if mcp_servers.remove(server_name).is_some() {
+                removed += 1;
+            }
+        }
+    }
+
+    let new_content = serde_json::to_string_pretty(&json).expect("Failed to serialize JSON");
+    fs::write(&claude_json_path, new_content).expect("Failed to write ~/.claude.json");
+
+    println!(
+        "{} Moved '{}' to global config (removed from {} {})",
+        "✓".green(),
+        server_name.green().bold(),
+        removed,
+        if removed == 1 { "project" } else { "projects" }
+    );
+
+    if !mcp_json_warn.is_empty() {
+        println!();
+        println!(
+            "{} Also defined in .mcp.json (remove manually):",
+            "Note:".yellow()
+        );
+        for p in &mcp_json_warn {
+            println!("  - {}", shorten_path(p));
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -835,5 +1004,6 @@ fn main() {
         Some(Commands::Remove { name }) => remove_mcp_server(&name),
         Some(Commands::Show { name }) => show_mcp_server(&name),
         Some(Commands::Migrate { name, from, to }) => migrate_mcp_server(&name, from, to),
+        Some(Commands::Globalize { name }) => globalize_mcp_server(&name),
     }
 }
