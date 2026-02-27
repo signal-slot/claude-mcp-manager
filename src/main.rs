@@ -38,6 +38,15 @@ enum Commands {
         /// Name of the MCP server
         name: String,
     },
+    /// Migrate all projects from one config to another (e.g. migrate vnc 1 2)
+    Migrate {
+        /// Name of the MCP server
+        name: String,
+        /// Source config group number
+        from: usize,
+        /// Target config group number
+        to: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,6 +700,126 @@ fn remove_mcp_server(name: &str) {
     );
 }
 
+fn migrate_mcp_server(name: &str, from: usize, to: usize) {
+    let all_servers = collect_all_mcp_servers();
+
+    let entries = match all_servers.get(name) {
+        Some(e) => e,
+        None => {
+            eprintln!("{} MCP server '{}' not found", "Error:".red(), name);
+            std::process::exit(1);
+        }
+    };
+
+    let groups = assign_config_groups(entries);
+    let n_groups = *groups.iter().max().unwrap_or(&1);
+
+    if from == 0 || from > n_groups || to == 0 || to > n_groups {
+        eprintln!(
+            "{} Invalid config group. Available: #1-#{}",
+            "Error:".red(),
+            n_groups
+        );
+        std::process::exit(1);
+    }
+
+    if from == to {
+        println!("{} #{}  and #{} are the same group", "Note:".yellow(), from, to);
+        return;
+    }
+
+    // Collect projects to migrate (only ~/.claude.json per-project entries)
+    let target_projects: Vec<&str> = entries
+        .iter()
+        .enumerate()
+        .filter(|(idx, e)| groups[*idx] == from && e.source_project != "(global)")
+        .map(|(_, e)| e.source_project.as_str())
+        .collect();
+
+    // Check for .mcp.json entries that can't be auto-migrated
+    let mcp_json_projects: Vec<&str> = entries
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| groups[*idx] == from)
+        .filter(|(_, e)| {
+            let path = std::path::Path::new(&e.source_project).join(".mcp.json");
+            if path.exists() {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(mcp_json) = serde_json::from_str::<McpJsonFile>(&content) {
+                        return mcp_json.mcp_servers.contains_key(name);
+                    }
+                }
+            }
+            false
+        })
+        .map(|(_, e)| e.source_project.as_str())
+        .collect();
+
+    if !mcp_json_projects.is_empty() {
+        println!(
+            "{} The following projects define '{}' in .mcp.json (manual update needed):",
+            "Note:".yellow(),
+            name
+        );
+        for p in &mcp_json_projects {
+            println!("  - {}", shorten_path(p));
+        }
+        println!();
+    }
+
+    // Filter to only ~/.claude.json per-project entries (exclude .mcp.json-only ones)
+    let claude_json_path = get_claude_json_path().expect("Failed to get claude.json path");
+    let content = fs::read_to_string(&claude_json_path).expect("Failed to read ~/.claude.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).expect("Failed to parse ~/.claude.json");
+
+    // Get the representative config from the target group
+    let to_rep_idx = groups.iter().position(|&g| g == to).unwrap();
+    let to_rep = &entries[to_rep_idx];
+
+    let mut migrated = 0;
+    for project_path in &target_projects {
+        // Check this project has the server in ~/.claude.json (not only in .mcp.json)
+        let has_in_claude_json = json
+            .get("projects")
+            .and_then(|p| p.get(*project_path))
+            .and_then(|c| c.get("mcpServers"))
+            .and_then(|m| m.get(name))
+            .is_some();
+
+        if !has_in_claude_json {
+            continue;
+        }
+
+        // Build new config with project-specific path substitution
+        let mut new_server = to_rep.server.clone();
+        for arg in &mut new_server.args {
+            if arg.contains(&to_rep.source_project) {
+                *arg = arg.replace(&to_rep.source_project, project_path);
+            }
+        }
+
+        json["projects"][*project_path]["mcpServers"][name] =
+            serde_json::to_value(&new_server).unwrap();
+        migrated += 1;
+    }
+
+    if migrated > 0 {
+        let new_content = serde_json::to_string_pretty(&json).expect("Failed to serialize JSON");
+        fs::write(&claude_json_path, new_content).expect("Failed to write ~/.claude.json");
+    }
+
+    println!(
+        "{} Migrated {} {} from #{} to #{} for '{}'",
+        "✓".green(),
+        migrated,
+        if migrated == 1 { "project" } else { "projects" },
+        from,
+        to,
+        name.green().bold()
+    );
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -705,5 +834,6 @@ fn main() {
         Some(Commands::Add { name, from }) => add_mcp_server(&name, from.as_deref()),
         Some(Commands::Remove { name }) => remove_mcp_server(&name),
         Some(Commands::Show { name }) => show_mcp_server(&name),
+        Some(Commands::Migrate { name, from, to }) => migrate_mcp_server(&name, from, to),
     }
 }
