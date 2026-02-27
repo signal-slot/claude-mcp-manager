@@ -80,6 +80,8 @@ struct ProjectConfig {
 
 #[derive(Debug, Deserialize)]
 struct ClaudeJson {
+    #[serde(rename = "mcpServers", default)]
+    mcp_servers: HashMap<String, McpServer>,
     #[serde(default)]
     projects: HashMap<String, ProjectConfig>,
 }
@@ -121,6 +123,16 @@ fn collect_all_mcp_servers() -> HashMap<String, Vec<McpEntry>> {
 
     // Load from ~/.claude.json
     if let Some(claude_json) = load_claude_json() {
+        // Global mcpServers (top-level)
+        for (name, server) in claude_json.mcp_servers {
+            let entry = McpEntry {
+                server,
+                source_project: "(global)".to_string(),
+            };
+            all_servers.entry(name).or_default().push(entry);
+        }
+
+        // Per-project mcpServers
         for (project_path, config) in claude_json.projects {
             for (name, server) in config.mcp_servers {
                 let entry = McpEntry {
@@ -166,10 +178,16 @@ fn get_current_project_mcp_servers() -> HashMap<String, McpServer> {
 
     let mut servers = HashMap::new();
 
-    // Check ~/.claude.json for current project
-    if let (Some(claude_json), Some(cwd)) = (load_claude_json(), &cwd_str) {
-        if let Some(config) = claude_json.projects.get(cwd) {
-            servers.extend(config.mcp_servers.clone());
+    // Check ~/.claude.json
+    if let Some(claude_json) = load_claude_json() {
+        // Global mcpServers apply to all projects
+        servers.extend(claude_json.mcp_servers.clone());
+
+        // Per-project mcpServers for current directory
+        if let Some(cwd) = &cwd_str {
+            if let Some(config) = claude_json.projects.get(cwd) {
+                servers.extend(config.mcp_servers.clone());
+            }
         }
     }
 
@@ -269,12 +287,16 @@ fn list_mcp_servers() {
         let mut sorted_entries: Vec<_> = entries.iter().collect();
         sorted_entries.sort_by_key(|e| &e.source_project);
         for entry in sorted_entries {
-            let is_cwd = entry.source_project == cwd;
-            let short_path = shorten_path(&entry.source_project);
-            if is_cwd {
-                println!("      {} {}", "→".green(), format!("{} (current)", short_path).green());
+            if entry.source_project == "(global)" {
+                println!("      - {}", "(global)".dimmed());
             } else {
-                println!("      - {}", short_path);
+                let is_cwd = entry.source_project == cwd;
+                let short_path = shorten_path(&entry.source_project);
+                if is_cwd {
+                    println!("      {} {}", "→".green(), format!("{} (current)", short_path).green());
+                } else {
+                    println!("      - {}", short_path);
+                }
             }
         }
         println!();
@@ -326,10 +348,15 @@ fn show_mcp_server(name: &str) {
             let baseline_args = normalize_args(&baseline.server.args, &baseline.source_project);
 
             for (i, entry) in entries.iter().enumerate() {
+                let source_display = if entry.source_project == "(global)" {
+                    "(global)".to_string()
+                } else {
+                    shorten_path(&entry.source_project)
+                };
                 println!(
                     "  {} {}",
                     format!("Configuration #{}:", i + 1).bold(),
-                    shorten_path(&entry.source_project).dimmed()
+                    source_display.dimmed()
                 );
 
                 // Highlight command/url if different from baseline
@@ -522,6 +549,19 @@ fn remove_mcp_server(name: &str) {
             name
         );
         std::process::exit(1);
+    }
+
+    // Check if it's a global server
+    if let Some(claude_json) = load_claude_json() {
+        if claude_json.mcp_servers.contains_key(name) {
+            println!(
+                "{} MCP server '{}' is defined globally in ~/.claude.json (top-level mcpServers)",
+                "Note:".yellow(),
+                name
+            );
+            println!("  Please remove it manually from ~/.claude.json");
+            return;
+        }
     }
 
     // Check if it's in local .mcp.json
