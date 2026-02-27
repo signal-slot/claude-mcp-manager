@@ -211,21 +211,33 @@ fn normalize_args(args: &[String], project_path: &str) -> Vec<String> {
         .collect()
 }
 
-fn configs_differ(entries: &[McpEntry]) -> bool {
-    if entries.len() <= 1 {
-        return false;
-    }
-    let first = &entries[0];
-    let first_args = normalize_args(&first.server.args, &first.source_project);
+/// Assign a config group index (1-based) to each entry based on normalized config similarity.
+fn assign_config_groups(entries: &[McpEntry]) -> Vec<usize> {
+    let mut groups = Vec::with_capacity(entries.len());
+    let mut representatives: Vec<usize> = Vec::new();
 
-    entries.iter().skip(1).any(|e| {
-        let args = normalize_args(&e.server.args, &e.source_project);
-        e.server.command != first.server.command
-            || e.server.url != first.server.url
-            || args != first_args
-            || e.server.env != first.server.env
-    })
+    for (i, entry) in entries.iter().enumerate() {
+        let norm_args = normalize_args(&entry.server.args, &entry.source_project);
+        let found = representatives.iter().position(|&rep_idx| {
+            let rep = &entries[rep_idx];
+            let rep_args = normalize_args(&rep.server.args, &rep.source_project);
+            entry.server.command == rep.server.command
+                && entry.server.url == rep.server.url
+                && norm_args == rep_args
+                && entry.server.env == rep.server.env
+        });
+        match found {
+            Some(pos) => groups.push(pos + 1),
+            None => {
+                representatives.push(i);
+                groups.push(representatives.len());
+            }
+        }
+    }
+    groups
 }
+
+
 
 fn list_mcp_servers() {
     let all_servers = collect_all_mcp_servers();
@@ -249,7 +261,9 @@ fn list_mcp_servers() {
     for name in names {
         let entries = &all_servers[name];
         let is_current = current_servers.contains_key(name);
-        let has_diff = configs_differ(entries);
+        let groups = assign_config_groups(entries);
+        let n_groups = *groups.iter().max().unwrap_or(&1);
+        let has_diff = n_groups > 1;
 
         let marker = if is_current {
             "●".green().to_string()
@@ -258,7 +272,7 @@ fn list_mcp_servers() {
         };
 
         let diff_marker = if has_diff {
-            format!(" {}", "(multiple configs)".yellow())
+            format!(" {}", format!("({} configs)", n_groups).yellow())
         } else {
             String::new()
         };
@@ -282,20 +296,40 @@ fn list_mcp_servers() {
             }
         }
 
-        // Show projects using this server (sorted)
-        println!("    {}", "used in:".dimmed());
-        let mut sorted_entries: Vec<_> = entries.iter().collect();
-        sorted_entries.sort_by_key(|e| &e.source_project);
-        for entry in sorted_entries {
-            if entry.source_project == "(global)" {
-                println!("      - {}", "(global)".dimmed());
-            } else {
-                let is_cwd = entry.source_project == cwd;
-                let short_path = shorten_path(&entry.source_project);
-                if is_cwd {
-                    println!("      {} {}", "→".green(), format!("{} (current)", short_path).green());
+        // Show projects using this server
+        if has_diff {
+            for g in 1..=n_groups {
+                println!("    {}",format!("#{}:", g).dimmed());
+                for (idx, entry) in entries.iter().enumerate() {
+                    if groups[idx] != g {
+                        continue;
+                    }
+                    if entry.source_project == "(global)" {
+                        println!("      - {}", "(global)".dimmed());
+                    } else {
+                        let is_cwd = entry.source_project == cwd;
+                        let short_path = shorten_path(&entry.source_project);
+                        if is_cwd {
+                            println!("      {} {}", "→".green(), format!("{} (current)", short_path).green());
+                        } else {
+                            println!("      - {}", short_path);
+                        }
+                    }
+                }
+            }
+        } else {
+            println!("    {}", "used in:".dimmed());
+            for entry in entries {
+                if entry.source_project == "(global)" {
+                    println!("      - {}", "(global)".dimmed());
                 } else {
-                    println!("      - {}", short_path);
+                    let is_cwd = entry.source_project == cwd;
+                    let short_path = shorten_path(&entry.source_project);
+                    if is_cwd {
+                        println!("      {} {}", "→".green(), format!("{} (current)", short_path).green());
+                    } else {
+                        println!("      - {}", short_path);
+                    }
                 }
             }
         }
@@ -343,32 +377,31 @@ fn show_mcp_server(name: &str) {
             println!("  {} {}", "Status:".dimmed(), status);
             println!();
 
-            // Use first entry as baseline for comparison
+            let groups = assign_config_groups(entries);
+            let n_groups = *groups.iter().max().unwrap_or(&1);
+
             let baseline = &entries[0];
             let baseline_args = normalize_args(&baseline.server.args, &baseline.source_project);
 
-            for (i, entry) in entries.iter().enumerate() {
-                let source_display = if entry.source_project == "(global)" {
-                    "(global)".to_string()
-                } else {
-                    shorten_path(&entry.source_project)
-                };
-                println!(
-                    "  {} {}",
-                    format!("Configuration #{}:", i + 1).bold(),
-                    source_display.dimmed()
-                );
+            for g in 1..=n_groups {
+                // Find the representative entry for this group
+                let rep_idx = groups.iter().position(|&gi| gi == g).unwrap();
+                let rep = &entries[rep_idx];
 
-                // Highlight command/url if different from baseline
-                if let Some(ref cmd) = entry.server.command {
-                    let cmd_display = if i > 0 && entry.server.command != baseline.server.command {
+                if n_groups > 1 {
+                    println!("  {}", format!("#{}:", g).bold());
+                }
+
+                // Show command/url, highlight if different from baseline
+                if let Some(ref cmd) = rep.server.command {
+                    let cmd_display = if g > 1 && rep.server.command != baseline.server.command {
                         cmd.yellow().to_string()
                     } else {
                         cmd.clone()
                     };
                     println!("    {} {}", "command:".dimmed(), cmd_display);
-                } else if let Some(ref url) = entry.server.url {
-                    let url_display = if i > 0 && entry.server.url != baseline.server.url {
+                } else if let Some(ref url) = rep.server.url {
+                    let url_display = if g > 1 && rep.server.url != baseline.server.url {
                         url.yellow().to_string()
                     } else {
                         url.clone()
@@ -376,42 +409,55 @@ fn show_mcp_server(name: &str) {
                     println!("    {} {}", "url:".dimmed(), url_display);
                 }
 
-                // Highlight args differences
-                if !entry.server.args.is_empty() {
-                    let normalized = normalize_args(&entry.server.args, &entry.source_project);
-                    if i > 0 && normalized != baseline_args {
-                        // Show args with differences highlighted
-                        let highlighted: Vec<String> = entry
-                            .server
-                            .args
+                // Show args, highlight differences from baseline
+                if !rep.server.args.is_empty() {
+                    let normalized = normalize_args(&rep.server.args, &rep.source_project);
+                    if g > 1 && normalized != baseline_args {
+                        let highlighted: Vec<String> = normalized
                             .iter()
-                            .zip(normalized.iter())
                             .enumerate()
-                            .map(|(j, (orig, norm))| {
+                            .map(|(j, norm)| {
                                 let baseline_norm = baseline_args.get(j);
                                 if baseline_norm != Some(norm) {
-                                    format!("\"{}\"", orig).yellow().to_string()
+                                    format!("\"{}\"", norm).yellow().to_string()
                                 } else {
-                                    format!("\"{}\"", orig)
+                                    format!("\"{}\"", norm)
                                 }
                             })
                             .collect();
                         println!("    {} [{}]", "args:".dimmed(), highlighted.join(", "));
                     } else {
-                        println!("    {} {:?}", "args:".dimmed(), entry.server.args);
+                        let display: Vec<String> = normalize_args(&rep.server.args, &rep.source_project)
+                            .iter()
+                            .map(|a| format!("\"{}\"", a))
+                            .collect();
+                        println!("    {} [{}]", "args:".dimmed(), display.join(", "));
                     }
                 }
 
-                // Highlight env if different from baseline
-                if !entry.server.env.is_empty() {
-                    if i > 0 && entry.server.env != baseline.server.env {
-                        println!("    {} {}", "env:".dimmed(), format!("{:?}", entry.server.env).yellow());
+                // Show env, highlight differences
+                if !rep.server.env.is_empty() {
+                    if g > 1 && rep.server.env != baseline.server.env {
+                        println!("    {} {}", "env:".dimmed(), format!("{:?}", rep.server.env).yellow());
                     } else {
-                        println!("    {} {:?}", "env:".dimmed(), entry.server.env);
+                        println!("    {} {:?}", "env:".dimmed(), rep.server.env);
                     }
-                } else if i > 0 && !baseline.server.env.is_empty() {
-                    // Baseline has env but this one doesn't
+                } else if g > 1 && !baseline.server.env.is_empty() {
                     println!("    {} {}", "env:".dimmed(), "(none)".yellow());
+                }
+
+                // Show projects in this group
+                println!("    {}", "used in:".dimmed());
+                for (idx, entry) in entries.iter().enumerate() {
+                    if groups[idx] != g {
+                        continue;
+                    }
+                    let source = if entry.source_project == "(global)" {
+                        "(global)".to_string()
+                    } else {
+                        shorten_path(&entry.source_project)
+                    };
+                    println!("      - {}", source);
                 }
                 println!();
             }
@@ -423,35 +469,65 @@ fn show_mcp_server(name: &str) {
     }
 }
 
+/// Parse `name#N` syntax. Returns (server_name, Option<1-based index>).
+fn parse_name_index(input: &str) -> (&str, Option<usize>) {
+    if let Some(pos) = input.rfind('#') {
+        if let Ok(idx) = input[pos + 1..].parse::<usize>() {
+            return (&input[..pos], Some(idx));
+        }
+    }
+    (input, None)
+}
+
 fn add_mcp_server(name: &str, from: Option<&str>) {
+    let (server_name, config_index) = parse_name_index(name);
+
     let all_servers = collect_all_mcp_servers();
     let current_servers = get_current_project_mcp_servers();
     let cwd = env::current_dir().expect("Failed to get current directory");
     let cwd_str = cwd.to_string_lossy().to_string();
 
-    if current_servers.contains_key(name) {
+    if current_servers.contains_key(server_name) {
         println!(
             "{} MCP server '{}' is already enabled in this project",
             "Note:".yellow(),
-            name
+            server_name
         );
         return;
     }
 
-    let entries = match all_servers.get(name) {
+    let entries = match all_servers.get(server_name) {
         Some(e) => e,
         None => {
             eprintln!(
                 "{} MCP server '{}' not found in any project",
                 "Error:".red(),
-                name
+                server_name
             );
             std::process::exit(1);
         }
     };
 
-    // Select configuration based on --from option or show options if multiple exist
-    let entry = if let Some(from_pattern) = from {
+    let groups = assign_config_groups(entries);
+    let n_groups = *groups.iter().max().unwrap_or(&1);
+    let has_diff = n_groups > 1;
+
+    // Select configuration based on #N group, --from option, or show options if multiple exist
+    let entry = if let Some(idx) = config_index {
+        if idx == 0 || idx > n_groups {
+            eprintln!(
+                "{} Invalid config index #{}. Available: #1-#{}",
+                "Error:".red(),
+                idx,
+                n_groups
+            );
+            eprintln!("Use 'cc-mcp-admin show {}' for details.", server_name);
+            std::process::exit(1);
+        }
+        // Pick the first entry belonging to the requested group
+        let pos = groups.iter().position(|&g| g == idx).unwrap();
+        &entries[pos]
+    } else if let Some(from_pattern) = from {
         match entries.iter().find(|e| e.source_project.contains(from_pattern)) {
             Some(e) => e,
             None => {
@@ -460,24 +536,32 @@ fn add_mcp_server(name: &str, from: Option<&str>) {
                     "Error:".red(),
                     from_pattern
                 );
-                eprintln!("Available configurations:");
-                for e in entries {
-                    eprintln!("  - {}", shorten_path(&e.source_project));
-                }
+                eprintln!("Use 'cc-mcp-admin show {}' for details.", server_name);
                 std::process::exit(1);
             }
         }
-    } else if entries.len() > 1 && configs_differ(entries) {
+    } else if has_diff {
         eprintln!(
-            "{} Multiple configurations found for '{}'. Use --from to specify:",
+            "{} {} configurations found for '{}'. Use #N to specify:",
             "Error:".red(),
-            name
+            n_groups,
+            server_name
         );
-        for e in entries {
-            eprintln!("  {} {}", "→".dimmed(), shorten_path(&e.source_project));
+        for g in 1..=n_groups {
+            let rep_idx = groups.iter().position(|&gi| gi == g).unwrap();
+            let rep = &entries[rep_idx];
+            let target = rep.server.display_target();
+            let count = groups.iter().filter(|&&gi| gi == g).count();
+            eprintln!(
+                "  #{} {} ({} {})",
+                g,
+                target,
+                count,
+                if count == 1 { "project" } else { "projects" }
+            );
         }
         eprintln!();
-        eprintln!("Example: cc-mcp-admin add {} --from votingmachine", name);
+        eprintln!("Example: cc-mcp-admin add {}#1", server_name);
         std::process::exit(1);
     } else {
         &entries[0]
@@ -516,7 +600,7 @@ fn add_mcp_server(name: &str, from: Option<&str>) {
     }
 
     // Add the server
-    json["projects"][&cwd_str]["mcpServers"][name] = serde_json::to_value(&server).unwrap();
+    json["projects"][&cwd_str]["mcpServers"][server_name] = serde_json::to_value(&server).unwrap();
 
     // Write back
     let new_content = serde_json::to_string_pretty(&json).expect("Failed to serialize JSON");
@@ -525,7 +609,7 @@ fn add_mcp_server(name: &str, from: Option<&str>) {
     println!(
         "{} Added MCP server '{}' to current project",
         "✓".green(),
-        name.green().bold()
+        server_name.green().bold()
     );
     if let Some(ref cmd) = server.command {
         println!("  {} {}", "command:".dimmed(), cmd);
